@@ -2,6 +2,7 @@ import argparse
 import s3fs
 import os 
 import sys
+import rioxarray as rxr
 from math import ceil
 from dotenv import load_dotenv
 
@@ -22,14 +23,14 @@ secret_key = os.getenv("AWS_SECRET_KEY")
 
 fs = s3fs.S3FileSystem(key=access_key, secret=secret_key, client_kwargs={'endpoint_url': 'https://us-iad-1.linodeobjects.com'}) 
 
-def raster_extractor(minx, maxx, miny, maxy, out_path, dest):
+def raster_extractor(minx, miny, maxx, maxy, crs, res, out_path, dest):
     qgs = QgsApplication([], False)
     qgs.initQgis()
     Processing.initialize()
 
     print('--> Check no. 1.')
 
-    minx, maxx, miny, maxy = float(minx), float(maxx), float(miny), float(maxy)
+    minx, miny, maxx, maxy = float(minx), float(miny), float(maxx), float(maxy)
 
     ######### FULL AREA #########
 
@@ -70,7 +71,7 @@ def raster_extractor(minx, maxx, miny, maxy, out_path, dest):
                     'EXTENT':extent_str,
                     'EXTENT_BUFFER':0,
                     'TILE_SIZE':tile_size,
-                    'MAP_UNITS_PER_PIXEL':0.3,
+                    'MAP_UNITS_PER_PIXEL':res,
                     'MAKE_BACKGROUND_TRANSPARENT':False,
                     'MAP_THEME':None,
                     'LAYERS':['wms://crs=EPSG:3857&format&type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=22&zmin=0&http-header:referer='],
@@ -83,6 +84,10 @@ def raster_extractor(minx, maxx, miny, maxy, out_path, dest):
 
             print('--> Check no. 4. In the for loop -- but just AFTER processing.')
 
+            raster_ex = rxr.open_rasterio(f'{out_path}/raster_{i}_{j}.tif', masked=True)
+            raster_ex.rio.write_crs(crs, inplace=True)
+            raster_ex.rio.to_raster(f'{out_path}/raster_{i}_{j}.tif')
+
     qgs.exitQgis()
 
     print('--> Check no. 5. Uploading to S3...')
@@ -94,15 +99,17 @@ def raster_extractor(minx, maxx, miny, maxy, out_path, dest):
 def main():
     parser = argparse.ArgumentParser(description='Raster extraction from QGIS baselayer map grid.')
     parser.add_argument('--minx', required=True, help='Min x value from bounding box.')
-    parser.add_argument('--maxx', required=True, help='Max x value from bounding box.')
     parser.add_argument('--miny', required=True, help='Min y value from bounding box.')
+    parser.add_argument('--maxx', required=True, help='Max x value from bounding box.')
     parser.add_argument('--maxy', required=True, help='Max y value from bounding box.')
+    parser.add_argument('--crs', required=True, help='Coordinate reference system for raster.')
+    parser.add_argument('--res', required=True, help='Spatial resolution for raster.')
     parser.add_argument('--out_path', required=True, help='Intermediate storage layer.')
     parser.add_argument('--dest', required=True, help='S3 bucket destination.')
 
     args = parser.parse_args()
 
-    raster_extractor(args.minx, args.maxx, args.miny, args.maxy, args.out_path, args.dest)
+    raster_extractor(args.minx, args.miny, args.maxx, args.maxy, args.crs, args.res, args.out_path, args.dest)
 
 if __name__ == '__main__':
     main()
