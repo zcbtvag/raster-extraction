@@ -4,8 +4,14 @@ import os
 import sys
 import fiona
 import rasterio
+import gc
+import zarr
+import dask
+import numpy as np
+import xarray as xr
 import rioxarray as rxr
 import geopandas as gpd
+from affine import Affine
 from shapely.geometry import Polygon 
 from rasterio.mask import mask
 from math import ceil
@@ -42,45 +48,57 @@ def tile_id_extractor(res, tile_size, out_path, dest, tile_id, out_crs=None):
 
     minx, miny, maxx, maxy = float(sentinel_tile.rio.bounds()[0]), float(sentinel_tile.rio.bounds()[1]), float(sentinel_tile.rio.bounds()[2]), float(sentinel_tile.rio.bounds()[3])
 
-    tile_size_updated = float(tile_size)
+    tile_size = int(tile_size) * 2
 
     ######### FULL AREA #########
 
-    # extent_str = f"{minx},{maxx},{miny},{maxy} [EPSG:3857]"
+    # extent_str = f"{minx},{maxx},{miny},{maxy} [{sentinel_tile.rio.crs}]"
 
     # parameters = {
     #                 'EXTENT':extent_str,
     #                 'EXTENT_BUFFER':0,
-    #                 'TILE_SIZE':1024, #maxx-minx,
-    #                 'MAP_UNITS_PER_PIXEL':0.3,
+    #                 'TILE_SIZE':maxx-minx,
+    #                 'MAP_UNITS_PER_PIXEL':res,
     #                 'MAKE_BACKGROUND_TRANSPARENT':False,
     #                 'MAP_THEME':None,
-    #                 'LAYERS':['wms://crs=EPSG:3857&format&type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=22&zmin=0&http-header:referer='],
+    #                 'LAYERS':[f'wms://crs={sentinel_tile.rio.crs}&format&type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=22&zmin=0&http-header:referer='],
     #                 'OUTPUT':f'{out_path}/full_extent_raster.tif'
     #         }
+
+    # print('PRE-PROCESSING')
     
     # processing.run('native:rasterize', parameters)
 
+    # print('POST-PROCESSING')
+
+    # raster_ex = rxr.open_rasterio(f'{out_path}/georef_raster_{i}_{j}.tif', masked=True)
+    # raster_ex.rio.write_crs(out_crs, inplace=True)
+    # raster_ex.rio.to_raster(f'{out_path}/georef_raster_{i}_{j}.tif')
+
     ######### INDIVIDUAL TILES #########
 
-    x_tiles = range(ceil((maxx - minx) / tile_size_updated))
-    y_tiles = range(ceil((maxy - miny) / tile_size_updated))
+    x_tiles = ceil((maxx - minx) / (tile_size / 2))
+    y_tiles = ceil((maxy - miny) / (tile_size / 2))
+
+    transform = Affine.translation(minx, miny) * Affine.scale(tile_size, -tile_size)
 
     print('--> Check no. 2.')
 
-    for i in x_tiles:
-        for j in y_tiles:
-            grid_tile = QgsRectangle(minx + i * tile_size_updated, 
-                            miny + j * tile_size_updated, 
-                            minx + (i + 1) * tile_size_updated, 
-                            miny + (j + 1) * tile_size_updated)
+    raster_datasets = []
+
+    for i in range(x_tiles):
+        for j in range(y_tiles):
+            grid_tile = QgsRectangle(minx + i * tile_size / 2, 
+                            miny + j * tile_size / 2, 
+                            minx + (i + 1) * tile_size / 2, 
+                            miny + (j + 1) * tile_size / 2)
 
             extent_str = f"{grid_tile.xMinimum()},{grid_tile.xMaximum()},{grid_tile.yMinimum()},{grid_tile.yMaximum()} [{sentinel_tile.rio.crs}]"
 
             parameters = {
                     'EXTENT':extent_str,
                     'EXTENT_BUFFER':0,
-                    'TILE_SIZE':tile_size_updated,
+                    'TILE_SIZE':tile_size / 2,
                     'MAP_UNITS_PER_PIXEL':res,
                     'MAKE_BACKGROUND_TRANSPARENT':False,
                     'MAP_THEME':None,
@@ -94,9 +112,18 @@ def tile_id_extractor(res, tile_size, out_path, dest, tile_id, out_crs=None):
 
             print('--> Check no. 4. In the for loop -- but just AFTER processing.')
 
-            raster_ex = rxr.open_rasterio(f'{out_path}/georef_raster_{i}_{j}.tif', masked=True)
+            raster_ex = rxr.open_rasterio(f'{out_path}/georef_raster_{i}_{j}.tif', masked=True, chunks={'x': tile_size, 'y': tile_size})
             raster_ex.rio.write_crs(out_crs, inplace=True)
             raster_ex.rio.to_raster(f'{out_path}/georef_raster_{i}_{j}.tif')
+            
+            raster_ds = raster_ex.to_dataset(name='data')
+            raster_datasets.append(raster_ds)
+            
+            del raster_ex
+            gc.collect()
+
+    combined_ds = xr.combine_by_coords(raster_datasets)
+    combined_ds.to_zarr(f'{out_path}/georef_raster.zarr', mode='w', consolidated=True)
 
     qgs.exitQgis()
 
@@ -119,35 +146,41 @@ def shapefile_extractor(res, tile_size, out_path, dest, shapefile, out_crs=None)
     updated_shape_gpd = shape_gpd.to_crs('epsg:3857')
     geometries = [geom for geom in list(updated_shape_gpd['geometry'])]
 
+    ######### INDIVIDUAL TILES #########
+
     minx, miny, maxx, maxy = float(updated_shape_gpd.bounds.iloc[0][0]), float(updated_shape_gpd.bounds.iloc[0][2]), float(updated_shape_gpd.bounds.iloc[0][1]), float(updated_shape_gpd.bounds.iloc[0][3])
 
-    tile_size_updated = float(tile_size)
+    tile_size = int(tile_size) * 2
 
-    x_tiles = range(ceil((maxx - minx) / tile_size_updated))
-    y_tiles = range(ceil((maxy - miny) / tile_size_updated))
+    x_tiles = range(ceil((maxx - minx) / (tile_size / 2)))
+    y_tiles = range(ceil((maxy - miny) / (tile_size / 2)))
+
+    transform = Affine.translation(minx, miny) * Affine.scale(tile_size, -tile_size)
+
+    raster_datasets = []
 
     for i in x_tiles:
         for j in y_tiles:
 
-            grid_tile_poly = Polygon([(minx + i * tile_size_updated, miny + j * tile_size_updated),
-                             (minx + (i + 1) * tile_size_updated, miny + j * tile_size_updated),
-                             (minx + (i + 1) * tile_size_updated, miny + (j + 1) * tile_size_updated),
-                             (minx + i * tile_size_updated, miny + (j + 1) * tile_size_updated)])
+            grid_tile_poly = Polygon([(minx + i * (tile_size / 2), miny + j * (tile_size / 2)),
+                             (minx + (i + 1) * (tile_size / 2), miny + j * (tile_size / 2)),
+                             (minx + (i + 1) * (tile_size / 2), miny + (j + 1) * (tile_size / 2)),
+                             (minx + i * (tile_size / 2), miny + (j + 1) * (tile_size / 2))])
             
             if not geometries[0].intersects(grid_tile_poly):
                 continue
             else: 
-                grid_tile = QgsRectangle(minx + i * tile_size_updated, 
-                            miny + j * tile_size_updated, 
-                            minx + (i + 1) * tile_size_updated, 
-                            miny + (j + 1) * tile_size_updated)
+                grid_tile = QgsRectangle(minx + i * (tile_size / 2), 
+                            miny + j * (tile_size / 2), 
+                            minx + (i + 1) * (tile_size / 2), 
+                            miny + (j + 1) * (tile_size / 2))
 
                 extent_str = f"{grid_tile.xMinimum()},{grid_tile.xMaximum()},{grid_tile.yMinimum()},{grid_tile.yMaximum()} [{updated_shape_gpd.crs}]"
 
                 parameters = {
                     'EXTENT':extent_str,
                     'EXTENT_BUFFER':0,
-                    'TILE_SIZE':tile_size_updated,
+                    'TILE_SIZE':tile_size / 2,
                     'MAP_UNITS_PER_PIXEL':res,
                     'MAKE_BACKGROUND_TRANSPARENT':False,
                     'MAP_THEME':None,
@@ -159,57 +192,68 @@ def shapefile_extractor(res, tile_size, out_path, dest, shapefile, out_crs=None)
 
                 processing.run('native:rasterize', parameters)
 
-                print('--> Check no. 1.2. In the for loop -- PRE-processing.')
+                print('--> Check no. 1.2. In the for loop -- POST-processing.')
 
-                raster_ex = rxr.open_rasterio(f'{out_path}/georef_raster_{i}_{j}.tif', masked=True)
+                raster_ex = rxr.open_rasterio(f'{out_path}/georef_raster_{i}_{j}.tif', masked=True, chunks={'x': tile_size, 'y': tile_size})
                 raster_ex.rio.write_crs(out_crs, inplace=True)
                 raster_ex.rio.to_raster(f'{out_path}/georef_raster_{i}_{j}.tif')
 
-    extent_str = f"{updated_shape_gpd.bounds.iloc[0][0]},{updated_shape_gpd.bounds.iloc[0][2]},{updated_shape_gpd.bounds.iloc[0][1]},{updated_shape_gpd.bounds.iloc[0][3]} [{updated_shape_gpd.crs}]"            
+                raster_ds = raster_ex.to_dataset(name='data')
+                raster_datasets.append(raster_ds)
+                
+                del raster_ex
+                gc.collect()
+        
+    combined_ds = xr.combine_by_coords(raster_datasets)
+    combined_ds.to_zarr(f'{out_path}/georef_raster.zarr', mode='w', consolidated=True)
 
-    parameters = {
-                'EXTENT':extent_str,
-                'EXTENT_BUFFER':0,
-                'TILE_SIZE':tile_size,
-                'MAP_UNITS_PER_PIXEL':res,
-                'MAKE_BACKGROUND_TRANSPARENT':False,
-                'MAP_THEME':None,
-                'LAYERS':[f'wms://crs={updated_shape_gpd.crs}&format&type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=22&zmin=0&http-header:referer='],
-                'OUTPUT':f'{out_path}/georef_raster.tif'
-        }
+    ######### FULL AREA #########
 
-    print('--> Check no. 2.1. PRE-processing.')
+    # extent_str = f"{updated_shape_gpd.bounds.iloc[0][0]},{updated_shape_gpd.bounds.iloc[0][2]},{updated_shape_gpd.bounds.iloc[0][1]},{updated_shape_gpd.bounds.iloc[0][3]} [{updated_shape_gpd.crs}]"            
 
-    processing.run('native:rasterize', parameters)
+    # parameters = {
+    #             'EXTENT':extent_str,
+    #             'EXTENT_BUFFER':0,
+    #             'TILE_SIZE':tile_size,
+    #             'MAP_UNITS_PER_PIXEL':res,
+    #             'MAKE_BACKGROUND_TRANSPARENT':False,
+    #             'MAP_THEME':None,
+    #             'LAYERS':[f'wms://crs={updated_shape_gpd.crs}&format&type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=22&zmin=0&http-header:referer='],
+    #             'OUTPUT':f'{out_path}/georef_raster.tif'
+    #     }
 
-    print('--> Check no. 2.2. POST-processing.')
+    # print('--> Check no. 2.1. PRE-processing.')
 
-    georef_rst = rxr.open_rasterio(f'{out_path}/georef_raster.tif', masked=True)
-    georef_rst.rio.write_crs(out_crs, inplace=True)
-    georef_rst.rio.to_raster(f'{out_path}/georef_raster.tif')
+    # processing.run('native:rasterize', parameters)
 
-    with rasterio.open(f'{out_path}/georef_raster.tif', 'r+') as rst:
-        rst.nodata = None
-        out_image, out_transform = mask(rst, geometries, crop=True, all_touched=True, invert=False)
-        out_meta = rst.meta
+    # print('--> Check no. 2.2. POST-processing.')
 
-        out_meta.update({
-        "driver": "GTiff",
-        "height": out_image.shape[1],
-        "width": out_image.shape[2],
-        "transform": out_transform
-    })
+    # georef_rst = rxr.open_rasterio(f'{out_path}/georef_raster.tif', masked=True)
+    # georef_rst.rio.write_crs(out_crs, inplace=True)
+    # georef_rst.rio.to_raster(f'{out_path}/georef_raster.tif')
 
-    with rasterio.open(f'{out_path}/georef_raster.tif', 'w', **out_meta) as dest:
-        dest.write(out_image)
+    # with rasterio.open(f'{out_path}/georef_raster.tif', 'r+') as rst:
+    #     rst.nodata = None
+    #     out_image, out_transform = mask(rst, geometries, crop=True, all_touched=True, invert=False)
+    #     out_meta = rst.meta
+
+    #     out_meta.update({
+    #     "driver": "GTiff",
+    #     "height": out_image.shape[1],
+    #     "width": out_image.shape[2],
+    #     "transform": out_transform
+    # })
+
+    # with rasterio.open(f'{out_path}/georef_raster.tif', 'w', **out_meta) as dest:
+    #     dest.write(out_image)
 
     qgs.exitQgis()
 
     print('--> Check no. 2.3. PRE--S3 upload.')
 
-    fs.put(f'{out_path}', f's3://{dest}', recursive=True) # Use below if paramvalidationError encountered.
+    # fs.put(f'{out_path}', f's3://{dest}', recursive=True) # Use below if paramvalidationError encountered.
 
-    # fs.put('/root/cyclops/raster-extraction/raster-extraction/shapefile-test', 's3://cyclops-sbx/tmp/raster-extraction', recursive=True)
+    fs.put('/root/cyclops/raster-extraction/raster-extraction/dual_shapefile', 's3://cyclops-sbx/tmp/raster-extraction', recursive=True)
     
     print('--> Check no. 2.4. S3 upload complete.')
 
